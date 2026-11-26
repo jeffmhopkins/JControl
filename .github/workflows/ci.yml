@@ -1,0 +1,253 @@
+# ci: the required checks that run on the PR's own code, and `dependency-review` on what it
+# changes in the dependency graph. `pr-title`, `lane-guard` and
+# `governance` run from the base commit in governance.yml; `review-gate` is in review-gate.yml.
+# The job names are the check names in repo.toml [checks].required (`scripts/repo config check`
+# compares them). Editing this file is a maintainer-only change.
+#
+# What comes from the stack pack (`stacks/<pack>/pack.toml`), so a new pack needs no edit here:
+# - each stack job's command (`scripts/repo stack run <job>`);
+# - its setup: `scripts/repo stack setup .stack-setup` copies the pack's `[ci].setup` action
+#   there, or a no-op action, and the next step runs it with the job's name;
+# - the files whose change makes `deps` run on a PR (`[ci].deps_paths`).
+# What stays here is the repo tool's own: it is written in Rust, so every job that runs it
+# sets up Rust (rust-setup), and fmt, lint, test and deps also check the tool itself.
+#
+# Third-party actions are pinned to full commit SHAs, with the release in a trailing comment.
+# Dependabot proposes updates. Manual pins: `git ls-remote --tags <repo>`, taking the
+# dereferenced (^{}) SHA of an annotated tag.
+
+name: ci
+
+on:
+  pull_request:
+    # Draft PRs skip every job; ready_for_review runs CI when a draft is marked ready.
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Job conditions:
+# - every job: skipped on a draft PR. PRs into a `wave/*` branch run every job (ADR-0007);
+# - `dependency-review`: runs on PRs only;
+# - `deps`: on a PR, does its work only when a path .github/scripts/deps-changed.py lists
+#   changes; otherwise it passes at once, so the required check still reports.
+# The build cache is saved only on a push to main; PR runs restore it and never write it.
+# `base-tool` runs only there: it saves the cache governance.yml restores.
+
+jobs:
+  fmt:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-name: fmt
+      - run: scripts/repo stack setup .stack-setup
+      - uses: ./.stack-setup
+        with:
+          job: fmt
+      - run: scripts/repo stack run fmt
+      - name: Format the repo tool
+        run: cargo fmt --manifest-path tools/repo/Cargo.toml --all --check
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.rust.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  lint:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-name: lint
+      - run: scripts/repo stack setup .stack-setup
+      - uses: ./.stack-setup
+        with:
+          job: lint
+      - run: scripts/repo stack run lint
+      - name: Lint the repo tool
+        run: cargo clippy --manifest-path tools/repo/Cargo.toml --all-targets --locked -- -D warnings
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.rust.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  test:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the tool's tests read git history
+      - id: rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-name: test
+      - run: scripts/repo stack setup .stack-setup
+      - uses: ./.stack-setup
+        with:
+          job: test
+      - name: Test the repo tool
+        run: cargo test --manifest-path tools/repo/Cargo.toml --locked
+      - run: scripts/repo stack run test
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.rust.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  deps:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2   # the PR's merge commit and its base parent
+      # On a PR, HEAD is GitHub's merge commit; its first parent is the base it merges into.
+      - id: changed
+        name: Did anything the deps job checks change
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          python3 -I .github/scripts/deps-changed.py
+      - id: rust
+        if: steps.changed.outputs.run == 'true'
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-name: deps
+      - if: steps.changed.outputs.run == 'true'
+        uses: ./.github/actions/cargo-deny
+      - if: steps.changed.outputs.run == 'true'
+        run: scripts/repo stack setup .stack-setup
+      - if: steps.changed.outputs.run == 'true'
+        uses: ./.stack-setup
+        with:
+          job: deps
+      - if: steps.changed.outputs.run == 'true'
+        run: scripts/repo stack run deps
+      - name: Advisories for the repo tool
+        if: steps.changed.outputs.run == 'true'
+        run: cargo deny --manifest-path tools/repo/Cargo.toml check advisories
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.rust.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  # The doc graph (docs/DOCS.md) and the config schema, including the required-check names.
+  docs:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # `docs check` reads history for review clocks and generated drift
+      - id: rust
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-name: docs
+      - run: scripts/repo config check
+      - run: scripts/repo docs check
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.rust.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  # The release build of the repo tool, cached under the name governance.yml restores.
+  base-tool:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: tool
+        uses: ./.github/actions/repo-tool
+        with:
+          cache-name: base-tool
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.tool.outputs.cache-key }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            tools/repo/target/
+
+  # The review gate's decision function, cut out of the deployed review-gate.yml and tested,
+  # and every YAML file under .github/ checked for repeated keys and tab indentation.
+  gate-test:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: node --test '.github/tests/*.test.mjs'
+
+  # The dependencies the PR adds or changes, from GitHub's dependency graph: fails on a known
+  # vulnerability of high or critical severity.
+  dependency-review:
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high

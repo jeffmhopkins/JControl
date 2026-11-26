@@ -1,0 +1,47 @@
+# The Rust stack pack. `scripts/repo stack run <job>` runs a job's command from the repo root,
+# and skips it when the detect file is absent. Schema: tools/repo (`scripts/repo config check`).
+# Editing this file is a governance change.
+
+detect = "Cargo.toml"
+
+[jobs]
+fmt  = "cargo fmt --all --check"
+lint = "cargo clippy --workspace --all-targets -- -D warnings"
+test = "cargo test --workspace"
+deps = "cargo deny check"
+
+[suppressions]
+# #[ignore] disables a test (R-TEST-004); its reason is `#[ignore = "..."]`, so it always
+# reports as missing `reason =`.
+patterns = ['#\[allow\(', '#!\[allow\(', '#\[expect\(', '#!\[expect\(', 'cfg_attr\(.*\b(allow|expect)\(',
+            '#\[ignore']
+reason_required = true   # suppression must carry `reason = "..."`
+
+# Manifest tables that set lint levels: an edit to one is a governance change.
+[protected_tables]
+"**/Cargo.toml" = ["lints", "workspace.lints"]
+
+# Lockfile glob → the command that relocks it, run in the lockfile's directory. `docs merge-main`
+# resolves a conflict in one by taking the merged branch's side and running the command, which
+# adds this branch's own dependencies back on top.
+[lockfiles]
+"**/Cargo.lock" = "cargo metadata --format-version 1 > /dev/null"
+
+[backrefs]
+roots = ["**/src/lib.rs", "**/src/main.rs"]
+prefix = "//! Docs:"
+
+# CI: the composite action every stack job runs after the repo tool's Rust setup, and the files
+# whose change on a PR makes the `deps` job run.
+[ci]
+setup = ".github/actions/rust-stack"
+deps_paths = ["**/Cargo.toml", "**/Cargo.lock", "**/deny.toml"]
+
+# The weekly sweep's items for this stack: each command's Markdown goes under its title.
+[[sweep]]
+title = "Dependency check (`cargo deny check`)"
+run = "cargo deny --color never check"
+
+[[sweep]]
+title = "Available updates"
+run = "bash .github/scripts/cargo-updates.sh Cargo.toml"

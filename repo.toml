@@ -1,0 +1,49 @@
+# The template's one config. Schema: tools/repo (`scripts/repo config check`).
+
+[template]
+source = "jeffmhopkins/template"   # the template's GitHub repo; equal to this repo's own in the template
+version = "0.1.0"
+
+[stack]
+pack = "rust"              # stacks/<pack>/pack.toml
+
+[docs]
+tracked = ["*.md", "docs/**/*.md", ".claude/skills/**/*.md", "stacks/**/*.md", "tools/repo/README.md"]
+exclude = ["CHANGELOG.md", "docs/adr/TEMPLATE.md"]
+max_cover_files = 12
+ledger = "docs/verified.toml"
+facts = "docs/facts.toml"
+external = "docs/external.toml"
+progress = "docs/progress.toml"
+
+[checks]
+required = ["fmt", "lint", "test", "deps", "docs", "pr-title", "gate-test", "lane-guard", "governance", "review-gate",
+            "dependency-review"]
+
+[governance]
+protected = [".github/**", ".claude/settings.json", ".claude/hooks/**", ".claude/skills/**", ".cargo/**",
+             "tools/repo/**", "stacks/**", "scripts/**", "repo.toml", "CLAUDE.md", "REVIEW.md",
+             "docs/DOCS.md", "docs/agents/**", "docs/SECURITY-AGENTS.md", ".gitattributes", ".editorconfig",
+             "deny.toml", "clippy.toml", "rustfmt.toml", "rust-toolchain.toml"]
+# The trust base: what runs with the repository's token, what classifies changes, what agents
+# may run unprompted, the reviewer's instructions, and the rules on who decides. The text of
+# every R-GOV-* rule counts too (the governance tool). This list protects itself: repo.toml
+# and the governance code are on it. R-GOV-007's applies_to and the list in
+# docs/agents/project-instructions.md copy it; `config check` compares them.
+maintainer_only = [".github/workflows/**", ".github/actions/**", ".github/scripts/**", ".github/after-review-status.sh",
+                   "repo.toml", "tools/repo/src/**", "stacks/*/pack.toml", ".claude/settings.json", "CLAUDE.md",
+                   "REVIEW.md", "docs/agents/review/**", "docs/agents/coordinator.md",
+                   "docs/agents/project-instructions.md", "docs/SECURITY-AGENTS.md",
+                   "docs/adr/0002-*.md", "docs/adr/0003-*.md"]
+
+[labels]
+governance = "governance-approved"
+override = "review-override"
+human = "needs-human"
+hardware = "hardware"
+
+[review]
+marker = "review v1"
+
+[lanes]
+file = "lanes.toml"

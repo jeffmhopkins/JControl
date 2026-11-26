@@ -1,0 +1,727 @@
+//! `governance`, `lane-guard`, `progress`, `plan check`, `config check`, `heads-changed`,
+//! `stack run`, `stack setup`, `stack sweep` and `pr-title` against temporary repositories.
+
+mod common;
+
+use common::{Fixture, doc};
+
+#[test]
+fn governance_lists_and_enforces() {
+    let f = Fixture::new(
+        "governance",
+        &[
+            ("docs/A.md", &doc("A", "a", "src/**", "About src.")),
+            ("src/a.rs", "fn a() {}\n"),
+        ],
+    );
+    f.git(&["tag", "base"]);
+    f.git(&["checkout", "-q", "-b", "work"]);
+    // Plain prose and code: no governance change.
+    f.write("src/a.rs", "fn a() { let _ = 1; }\n");
+    f.commit("code");
+    let r = f.repo(&["governance", "--base", "base", "--labels", ""]);
+    assert!(
+        r.ok() && r.out.contains("no governance changes"),
+        "{}",
+        r.out
+    );
+    // Narrowed covers, a new suppression, a protected file and a maintainer-only file.
+    f.write("docs/A.md", &doc("A", "a", "src/a.rs", "About src."));
+    f.write("src/a.rs", "#[allow(dead_code)]\nfn a() {}\n");
+    f.write(".github/workflows/ci.yml", "jobs:\n  fmt:\n");
+    f.write("REVIEW.md", "x\n");
+    f.commit("governance");
+    let list = f.repo(&["governance", "--base", "base"]);
+    assert!(list.ok(), "listing never fails: {}", list.out);
+    for needle in [
+        "docs/A.md: section `#a` `covers`",
+        "src/a.rs: line 1: new suppression `#[allow(dead_code)]` (missing `reason",
+        ".github/workflows/ci.yml: adds a protected path",
+        "maintainer-only: REVIEW.md",
+    ] {
+        assert!(
+            list.out.contains(needle),
+            "missing {needle:?} in\n{}",
+            list.out
+        );
+    }
+    let body = f.path().join("../gov-body.md");
+    std::fs::write(
+        &body,
+        "## Summary\nx\n\n## Governance change\nNarrows covers to the one file it describes.\n",
+    )
+    .unwrap();
+    let body = body.to_string_lossy().into_owned();
+    let unlabeled = f.repo(&[
+        "governance",
+        "--base",
+        "base",
+        "--pr-body",
+        &body,
+        "--labels",
+        "bug",
+    ]);
+    assert_eq!(unlabeled.code, 1, "{}", unlabeled.out);
+    assert!(
+        unlabeled
+            .out
+            .contains("lacks the `governance-approved` label"),
+        "{}",
+        unlabeled.out
+    );
+    // REVIEW.md is maintainer-only and the section is there: only the label is missing.
+    assert!(
+        unlabeled
+            .out
+            .contains("governance: only the maintainer's label is missing"),
+        "{}",
+        unlabeled.out
+    );
+    let ok = f.repo(&[
+        "governance",
+        "--base",
+        "base",
+        "--pr-body",
+        &body,
+        "--labels",
+        "bug,governance-approved",
+    ]);
+    assert!(ok.ok(), "{}", ok.out);
+    let _ = std::fs::remove_file(&body);
+    // The head's own config cannot unprotect a path: the base's rules apply.
+    f.write("repo.toml", &common::CONFIG.replace("\".github/**\", ", ""));
+    f.commit("unprotect");
+    let r = f.repo(&["governance", "--base", "base"]);
+    assert!(
+        r.out
+            .contains(".github/workflows/ci.yml: adds a protected path"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("repo.toml: edits a protected path"),
+        "{}",
+        r.out
+    );
+}
+
+#[test]
+fn governance_into_a_wave() {
+    let f = Fixture::new(
+        "gov-wave",
+        &[
+            (".github/workflows/ci.yml", "jobs:\n  fmt:\n"),
+            ("src/a.rs", "fn a() {}\n"),
+        ],
+    );
+    f.git(&["branch", "wave/a"]);
+    // Main moves, with a protected change.
+    f.write(".github/workflows/ci.yml", "jobs:\n  fmt:\n  docs:\n");
+    f.commit("ci on main");
+    // A sync PR: main merged into a branch off the wave. Main's files are skipped.
+    f.git(&["checkout", "-q", "-b", "sync", "wave/a"]);
+    f.git(&["merge", "-q", "--no-edit", "main"]);
+    let args = [
+        "governance",
+        "--base",
+        "wave/a",
+        "--into",
+        "wave/a",
+        "--main",
+        "main",
+        "--labels",
+        "",
+    ];
+    let r = f.repo(&args);
+    assert!(r.ok() && r.out.contains("as on main, skipped"), "{}", r.out);
+    // A builder PR into the wave that edits a protected path fails, label or not.
+    f.git(&["checkout", "-q", "-b", "pr", "wave/a"]);
+    f.write(".github/workflows/ci.yml", "jobs:\n  nothing:\n");
+    f.commit("loosen ci inside the wave");
+    let body = f.path().join("../gov-wave-body.md");
+    std::fs::write(&body, "## Governance change\nA reason.\n").unwrap();
+    let body = body.to_string_lossy().into_owned();
+    let labeled = [
+        "governance",
+        "--base",
+        "wave/a",
+        "--into",
+        "wave/a",
+        "--main",
+        "main",
+        "--pr-body",
+        &body,
+        "--labels",
+        "governance-approved",
+    ];
+    let r = f.repo(&labeled);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(r.out.contains("target `main` instead"), "{}", r.out);
+    // The same change into main passes with the label and the section.
+    let r = f.repo(&[
+        "governance",
+        "--base",
+        "main",
+        "--pr-body",
+        &body,
+        "--labels",
+        "governance-approved",
+    ]);
+    assert!(r.ok(), "{}", r.out);
+    let _ = std::fs::remove_file(&body);
+}
+
+#[test]
+fn lane_guard_checks_claims() {
+    let f = Fixture::new(
+        "lanes",
+        &[("lanes.toml", "protocol = { value = 21, holder = 500 }\n")],
+    );
+    f.git(&["checkout", "-q", "-b", "pr"]);
+    f.write(
+        "lanes.toml",
+        "protocol = { value = 22, holder = 512 }\nschema = { value = 1, holder = 512 }\n",
+    );
+    f.commit("claim");
+    let ok = f.repo(&[
+        "lane-guard",
+        "--base",
+        "main",
+        "--head",
+        "HEAD",
+        "--pr",
+        "512",
+    ]);
+    assert!(ok.ok(), "{}", ok.out);
+    let wrong = f.repo(&[
+        "lane-guard",
+        "--base",
+        "main",
+        "--head",
+        "HEAD",
+        "--pr",
+        "513",
+    ]);
+    assert_eq!(wrong.code, 1, "{}", wrong.out);
+    // Main took the slot first: the claim is no longer base + 1.
+    f.git(&["checkout", "-q", "main"]);
+    f.write("lanes.toml", "protocol = { value = 22, holder = 600 }\n");
+    f.commit("other claim");
+    let stale = f.repo(&[
+        "lane-guard",
+        "--base",
+        "main",
+        "--head",
+        "pr",
+        "--pr",
+        "512",
+    ]);
+    assert_eq!(stale.code, 1, "{}", stale.out);
+    assert!(stale.out.contains("must be 23"), "{}", stale.out);
+    let none = f.repo(&[
+        "lane-guard",
+        "--base",
+        "main",
+        "--head",
+        "main",
+        "--pr",
+        "1",
+    ]);
+    assert!(
+        none.ok() && none.out.contains("changes no lane"),
+        "{}",
+        none.out
+    );
+}
+
+#[test]
+fn lane_guard_checks_lane_files_and_wave_landings() {
+    let decl = "protocol = { value = 3, holder = 9, files = [\"src/version.rs\"], pattern = 'PROTOCOL' }\n";
+    let origin = Fixture::new(
+        "lane-files-origin",
+        &[
+            ("lanes.toml", decl),
+            ("src/version.rs", "pub const PROTOCOL: u32 = 3;\n"),
+        ],
+    );
+    origin.git(&["branch", "wave/a"]);
+    let f = origin.clone_as("lane-files");
+    f.git(&["checkout", "-q", "-b", "pr"]);
+    let guard = |extra: &[&str]| {
+        let args = [
+            "lane-guard",
+            "--base",
+            "origin/main",
+            "--head",
+            "HEAD",
+            "--pr",
+            "12",
+        ];
+        f.repo(&[&args[..], extra].concat())
+    };
+    // Bumping the value in code without a claim fails.
+    f.write("src/version.rs", "pub const PROTOCOL: u32 = 4;\n");
+    f.commit("bump in code only");
+    let r = guard(&[]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(r.out.contains("makes no claim"), "{}", r.out);
+    // With the claim it passes.
+    f.write(
+        "lanes.toml",
+        &decl.replace("value = 3, holder = 9", "value = 4, holder = 12"),
+    );
+    f.commit("claim");
+    let r = guard(&[]);
+    assert!(r.ok(), "{}", r.out);
+    // `--wave` only for a wave branch on origin into main.
+    assert_eq!(guard(&["--wave"]).code, 2);
+    let r = guard(&["--wave", "--head-ref", "pr", "--base-ref", "main"]);
+    assert!(r.code == 2 && r.out.contains("landing PR"), "{}", r.out);
+    let r = guard(&["--wave", "--head-ref", "wave/b", "--base-ref", "main"]);
+    assert!(
+        r.code == 2 && r.out.contains("not a branch on origin"),
+        "{}",
+        r.out
+    );
+    let r = guard(&["--wave", "--head-ref", "wave/a", "--base-ref", "main"]);
+    assert!(r.ok(), "{}", r.out);
+}
+
+const PLAN: &str = "[[milestone]]\nid = \"M0\"\ntitle = \"Start\"\ndemo = \"It runs.\"\n\n[[item]]\nid = \"M0-1\"\nmilestone = \"M0\"\ntitle = \"One\"\n\n[[item]]\nid = \"M0-2\"\nmilestone = \"M0\"\ntitle = \"Two\"\ndeps = [\"M0-1\"]\nhardware = true\n\n[[item]]\nid = \"M0-3\"\nmilestone = \"M0\"\ntitle = \"Three\"\n";
+
+#[test]
+fn progress_from_trailers_with_reverts() {
+    let f = Fixture::new("progress", &[("docs/progress.toml", PLAN)]);
+    for (file, msg) in [
+        ("a", "feat: one (#1)\n\nCompletes: M0-1"),
+        ("b", "feat: two (#2)\n\nCompletes: M0-2"),
+        ("c", "feat: three part (#3)\n\nPart-of: M0-3"),
+        ("d", "feat: three (#4)\n\nCompletes: M0-3"),
+    ] {
+        f.write(file, msg);
+        f.git(&["add", "-A"]);
+        f.git(&["commit", "-q", "-m", msg]);
+    }
+    f.git(&["revert", "--no-edit", "HEAD"]);
+    let r = f.repo(&["progress", "--format", "json"]);
+    assert!(r.ok(), "{}", r.out);
+    let v: serde_json::Value = serde_json::from_str(&r.out).expect("json");
+    let statuses: Vec<&str> = v["milestones"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, vec!["done", "hardware", "in-progress"]);
+    f.write("e", "x");
+    f.git(&["add", "-A"]);
+    f.git(&[
+        "commit",
+        "-q",
+        "-m",
+        "chore: run (#5)\n\nVerified-on-hardware: M0-2",
+    ]);
+    // A range's trailers, for a wave's landing PR: the reverted M0-3 completion is gone.
+    let r = f.repo(&["progress", "--trailers", "HEAD~5..HEAD"]);
+    assert!(r.ok(), "{}", r.out);
+    assert_eq!(
+        r.out, "Completes: M0-2\nPart-of: M0-3\nVerified-on-hardware: M0-2\n",
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        f.repo(&["progress", "--trailers", "x", "--format", "json"])
+            .code,
+        2
+    );
+    let md = f.repo(&["progress"]);
+    assert!(
+        md.ok() && md.out.contains("| M0: Start | 2 of 3 | 1 | 0 | 0 |"),
+        "{}",
+        md.out
+    );
+    // `docs check` validates the plan.
+    f.write(
+        "docs/progress.toml",
+        &format!("{PLAN}\n[[item]]\nid = \"M0-1\"\nmilestone = \"M0\"\ntitle = \"dup\"\n"),
+    );
+    let r = f.repo(&["docs", "check"]);
+    assert!(
+        !r.ok() && r.out.contains("duplicate item `M0-1`"),
+        "{}",
+        r.out
+    );
+}
+
+#[test]
+fn plan_check_finds_overlaps() {
+    let f = Fixture::dir("plan");
+    let launch = "# Launch\n\n<a id=\"B1\"></a>\n## B1\n| Field | Value |\n|---|---|\n| owns | `src/a/**` |\n\n<a id=\"B2\"></a>\n## B2\n| owns | `src/b/**`, `docs/B.md` |\n\n<a id=\"B3\"></a>\n## B3\n| owns | `src/**` |\n";
+    let roster = "| Row | Session | State |\n|---|---|---|\n| planner | s0 | running |\n| B1 | s1 | running |\n| B2 | s2 | review |\n| B3 | s3 | merged |\n";
+    f.write("launch.md", launch);
+    f.write("roster.md", roster);
+    let (l, r) = (f.path().join("launch.md"), f.path().join("roster.md"));
+    let (l, r) = (l.to_string_lossy(), r.to_string_lossy());
+    let ok = f.repo(&["plan", "check", &l, &r]);
+    assert!(ok.ok(), "{}", ok.out);
+    let bad = f.repo(&["plan", "check", &l, &r, "--row", "B3"]);
+    assert_eq!(bad.code, 1, "{}", bad.out);
+    assert!(
+        bad.out.contains("rows `B1` and `B3`") && bad.out.contains("rows `B2` and `B3`"),
+        "{}",
+        bad.out
+    );
+    let unknown = f.repo(&["plan", "check", &l, &r, "--row", "B9"]);
+    assert_eq!(unknown.code, 1, "{}", unknown.out);
+}
+
+#[test]
+fn config_check_compares_required_checks_with_workflows() {
+    let f = Fixture::new("config", &[("lanes.toml", "# none\n")]);
+    let r = f.repo(&["config", "check"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains("required check `fmt` is not a check name"),
+        "{}",
+        r.out
+    );
+    // A job with a `name:` reports under its name, not its id.
+    f.write(
+        ".github/workflows/ci.yml",
+        "on: push\njobs:\n  fmt:\n    runs-on: x\n  docs:\n    name: Docs build\n    runs-on: x\n",
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(!r.ok() && r.out.contains("`docs`"), "{}", r.out);
+    f.write(".github/workflows/ci.yml", "on: push\njobs:\n  fmt:\n    runs-on: x\n  documentation:\n    name: docs\n    runs-on: x\n");
+    let r = f.repo(&["config", "check"]);
+    assert!(r.ok(), "{}", r.out);
+    f.write(
+        "repo.toml",
+        &format!("{}\n[extra]\nx = 1\n", common::CONFIG),
+    );
+    let r = f.repo(&["config", "check"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(r.out.contains("unknown field `extra`"), "{}", r.out);
+    f.write(
+        "repo.toml",
+        &common::CONFIG.replace("source = \"owner/template\"\n", ""),
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(
+        !r.ok() && r.out.contains("[template].source is missing"),
+        "{}",
+        r.out
+    );
+    f.write(
+        "repo.toml",
+        &common::CONFIG.replace("owner/template", "https://github.com/owner/template"),
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(!r.ok() && r.out.contains("is not a GitHub"), "{}", r.out);
+    f.write("repo.toml", common::CONFIG);
+    f.write("lanes.toml", "p = { value = 1 }\n");
+    let r = f.repo(&["config", "check"]);
+    assert!(!r.ok() && r.out.contains("lane `p`"), "{}", r.out);
+}
+
+#[test]
+fn config_check_compares_copies_of_the_config() {
+    let f = Fixture::new("config-copies", &[("lanes.toml", "# none\n")]);
+    f.write(
+        ".github/workflows/ci.yml",
+        "on: push\njobs:\n  fmt:\n    runs-on: x\n  docs:\n    runs-on: x\n",
+    );
+    assert!(f.repo(&["config", "check"]).ok());
+    // A workflow copy of a label, annotated, must match repo.toml.
+    f.write(
+        ".github/workflows/governance.yml",
+        "env:\n  # [labels].governance in repo.toml.\n  GOVERNANCE_LABEL: gov-ok\njobs:\n  x:\n    runs-on: x\n",
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(
+        !r.ok()
+            && r.out
+                .contains("governance.yml:3: annotated with [labels].governance"),
+        "{}",
+        r.out
+    );
+    f.write(
+        ".github/workflows/governance.yml",
+        "env:\n  GOVERNANCE_LABEL: governance-approved\njobs:\n  x:\n    runs-on: x\n",
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(
+        !r.ok() && r.out.contains("no line is annotated `[labels].governance"),
+        "{}",
+        r.out
+    );
+    f.write(
+        ".github/workflows/governance.yml",
+        "env:\n  GOVERNANCE_LABEL: governance-approved   # [labels].governance in repo.toml\njobs:\n  x:\n    runs-on: x\n",
+    );
+    assert!(f.repo(&["config", "check"]).ok());
+    // R-GOV-007 and the instructions list the same maintainer-only paths as repo.toml.
+    let rule = |applies: &str| {
+        format!(
+            "<!-- @doc\nid = \"RULES\"\ntitle = \"R\"\nkind = \"normative\"\nstatus = \"active\"\n-->\n<a id=\"g\"></a>\n## G\n<!-- @section\n-->\n\n<a id=\"R-GOV-007\"></a>\n### R-GOV-007: M\n<!-- @rule\nstatus = \"active\"\nenforced_by = [\"review\"]\napplies_to = {applies}\n-->\nText.\n"
+        )
+    };
+    f.write("docs/RULES.md", &rule("[\"REVIEW.md\"]"));
+    assert!(f.repo(&["config", "check"]).ok());
+    f.write("docs/RULES.md", &rule("[\"REVIEW.md\", \"x/**\"]"));
+    let r = f.repo(&["config", "check"]);
+    assert!(
+        !r.ok() && r.out.contains("R-GOV-007's applies_to differs") && r.out.contains("x/**"),
+        "{}",
+        r.out
+    );
+    f.write("docs/RULES.md", &rule("[\"REVIEW.md\"]"));
+    let instructions = |list: &str| {
+        format!(
+            "**Maintainer-only paths** (`[governance].maintainer_only` in `repo.toml`), always: {list}. More.\n"
+        )
+    };
+    f.write(
+        "docs/agents/project-instructions.md",
+        &instructions("`REVIEW.md`"),
+    );
+    assert!(f.repo(&["config", "check"]).ok());
+    f.write(
+        "docs/agents/project-instructions.md",
+        &instructions("`CLAUDE.md`"),
+    );
+    let r = f.repo(&["config", "check"]);
+    assert!(
+        !r.ok()
+            && r.out
+                .contains("missing [\"REVIEW.md\"], extra [\"CLAUDE.md\"]"),
+        "{}",
+        r.out
+    );
+}
+
+#[test]
+fn root_points_at_another_tree() {
+    let f = Fixture::new("root", &[("lanes.toml", "# none\n")]);
+    f.write(
+        ".github/workflows/ci.yml",
+        "on: push\njobs:\n  fmt:\n    runs-on: x\n  docs:\n    runs-on: x\n",
+    );
+    f.commit("workflows");
+    // Run from an unrelated directory, pointed at the fixture.
+    let elsewhere = Fixture::dir("root-elsewhere");
+    let dir = f.path().to_string_lossy().into_owned();
+    let r = elsewhere.repo(&["--root", &dir, "config", "check"]);
+    assert!(r.ok() && r.out.contains("config check: ok"), "{}", r.out);
+    assert_eq!(elsewhere.repo(&["config", "check"]).code, 2);
+    let missing = elsewhere.repo(&["--root", "/nonexistent/tree", "config", "check"]);
+    assert_eq!(missing.code, 2, "{}", missing.out);
+}
+
+#[test]
+fn governance_exempts_dependabot_repins() {
+    let pinned = "on: push\njobs:\n  fmt:\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+    let f = Fixture::new("repin", &[(".github/workflows/ci.yml", pinned)]);
+    f.git(&["tag", "base"]);
+    f.git(&["checkout", "-q", "-b", "dependabot/x"]);
+    f.write(
+        ".github/workflows/ci.yml",
+        &pinned.replace(
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "1111111111111111111111111111111111111111 # v7.1.0",
+        ),
+    );
+    f.commit("ci(deps): bump actions/checkout");
+    let args = ["governance", "--base", "base", "--labels", ""];
+    let bot = f.repo(&[&args[..], &["--author", "dependabot[bot]"]].concat());
+    assert!(bot.ok() && bot.out.contains("is exempt"), "{}", bot.out);
+    let agent = f.repo(&[&args[..], &["--author", "someone"]].concat());
+    assert_eq!(agent.code, 1, "{}", agent.out);
+    f.write(
+        ".github/workflows/ci.yml",
+        &format!("{pinned}      - run: echo extra\n"),
+    );
+    f.commit("more");
+    let mixed = f.repo(&[&args[..], &["--author", "dependabot[bot]"]].concat());
+    assert_eq!(mixed.code, 1, "{}", mixed.out);
+}
+
+#[test]
+fn heads_changed_tracks_origin() {
+    let origin = Fixture::new("heads-origin", &[]);
+    let work = origin.clone_as("heads-work");
+    let state = work.path().join("../heads-state.txt");
+    let state = state.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&state);
+    let run = || work.repo(&["heads-changed", "--state", &state]);
+    assert_eq!(run().out.trim(), "changed");
+    assert_eq!(run().out.trim(), "unchanged");
+    // A branch that is neither main nor a wave doesn't count.
+    origin.git(&["branch", "claude/row-1"]);
+    assert_eq!(run().out.trim(), "unchanged");
+    origin.write("x", "x");
+    origin.commit("move");
+    let r = run();
+    assert!(r.ok() && r.out.trim() == "changed", "{}", r.out);
+    origin.git(&["branch", "wave/w1"]);
+    assert_eq!(run().out.trim(), "changed");
+    assert!(
+        std::fs::read_to_string(&state)
+            .unwrap()
+            .contains("refs/heads/wave/w1")
+    );
+    // --refs watches other refs instead.
+    let only_rows = work.repo(&[
+        "heads-changed",
+        "--state",
+        &state,
+        "--refs",
+        "refs/heads/claude/**",
+    ]);
+    assert_eq!(only_rows.out.trim(), "changed");
+    assert!(
+        !std::fs::read_to_string(&state)
+            .unwrap()
+            .contains("refs/heads/main")
+    );
+    let _ = std::fs::remove_file(&state);
+}
+
+#[test]
+fn stack_run_skips_without_detect_file() {
+    let f = Fixture::new("stack", &[]);
+    let r = f.repo(&["stack", "run", "fmt"]);
+    assert!(r.ok() && r.out.contains("skip: no Cargo.toml"), "{}", r.out);
+    f.write("Cargo.toml", "");
+    let r = f.repo(&["stack", "run", "fmt"]);
+    assert!(r.ok() && r.out.contains("formatting"), "{}", r.out);
+    assert_eq!(f.repo(&["stack", "run", "nope"]).code, 2);
+}
+
+#[test]
+fn stack_setup_puts_the_pack_action_in_place() {
+    let pack = format!(
+        "{}[ci]\nsetup = \".github/actions/rust-stack\"\n",
+        common::PACK
+    );
+    let f = Fixture::new(
+        "stack-setup",
+        &[
+            ("stacks/rust/pack.toml", &pack),
+            (
+                ".github/actions/rust-stack/action.yml",
+                "name: rust-stack\n",
+            ),
+            (".github/actions/rust-stack/lib/x.sh", "echo x\n"),
+        ],
+    );
+    // No Cargo.toml yet: a no-op action, whatever the pack names.
+    let r = f.repo(&["stack", "setup", ".stack-setup"]);
+    assert!(r.ok() && r.out.contains("skip: no Cargo.toml"), "{}", r.out);
+    assert!(
+        f.read(".stack-setup/action.yml")
+            .contains("No stack setup.")
+    );
+    // In use: the pack's action, its whole directory, replacing the earlier one.
+    f.write("Cargo.toml", "");
+    let r = f.repo(&["stack", "setup", ".stack-setup/"]);
+    assert!(r.ok() && r.out.contains("rust-stack"), "{}", r.out);
+    assert_eq!(f.read(".stack-setup/action.yml"), "name: rust-stack\n");
+    assert_eq!(f.read(".stack-setup/lib/x.sh"), "echo x\n");
+    // Never over tracked files, and never outside the repository.
+    assert_eq!(f.repo(&["stack", "setup", "stacks"]).code, 2);
+    assert_eq!(f.repo(&["stack", "setup", "../out"]).code, 2);
+    // A pack without [ci].setup gets the no-op action.
+    f.write("stacks/rust/pack.toml", common::PACK);
+    let r = f.repo(&["stack", "setup", ".stack-setup"]);
+    assert!(r.ok() && r.out.contains("no [ci].setup"), "{}", r.out);
+    assert!(
+        f.read(".stack-setup/action.yml")
+            .contains("No stack setup.")
+    );
+}
+
+#[test]
+fn stack_sweep_reports_each_item_and_never_fails() {
+    let pack = format!(
+        "{}[[sweep]]\ntitle = \"Quiet\"\nrun = \"true\"\n\n[[sweep]]\ntitle = \"Report\"\nrun = \"echo '- all current'\"\n\n[[sweep]]\ntitle = \"Broken\"\nrun = \"echo bad advisory >&2; exit 3\"\n",
+        common::PACK
+    );
+    let f = Fixture::new("stack-sweep", &[("stacks/rust/pack.toml", &pack)]);
+    let r = f.repo(&["stack", "sweep"]);
+    assert!(
+        r.ok() && r.out.matches("Skipped: no `Cargo.toml`").count() == 3,
+        "{}",
+        r.out
+    );
+    f.write("Cargo.toml", "");
+    let r = f.repo(&["stack", "sweep"]);
+    assert!(r.ok(), "{}", r.out);
+    let order: Vec<usize> = ["### Quiet", "### Report", "### Broken"]
+        .iter()
+        .map(|t| r.out.find(t).expect("every title"))
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{}", r.out);
+    assert!(r.out.contains("Passed: `true`."), "{}", r.out);
+    assert!(r.out.contains("- all current"), "{}", r.out);
+    assert!(
+        r.out.contains("**Failed** (exit 3)") && r.out.contains("bad advisory"),
+        "{}",
+        r.out
+    );
+    f.write("stacks/rust/pack.toml", common::PACK);
+    let r = f.repo(&["stack", "sweep"]);
+    assert!(r.ok() && r.out.contains("no sweep items"), "{}", r.out);
+}
+
+#[test]
+fn config_check_reads_the_ci_and_sweep_tables() {
+    let f = Fixture::new(
+        "config-ci",
+        &[
+            ("lanes.toml", "# none\n"),
+            (
+                ".github/workflows/ci.yml",
+                "on: push\njobs:\n  fmt:\n    runs-on: x\n  docs:\n    runs-on: x\n",
+            ),
+            (".github/actions/rust-stack/action.yml", "name: x\n"),
+        ],
+    );
+    let with = |extra: &str| {
+        f.write("stacks/rust/pack.toml", &format!("{}{extra}", common::PACK));
+        f.repo(&["config", "check"])
+    };
+    let r = with(
+        "[ci]\nsetup = \".github/actions/rust-stack\"\ndeps_paths = [\"**/Cargo.lock\"]\n\n[[sweep]]\ntitle = \"A\"\nrun = \"true\"\n",
+    );
+    assert!(r.ok(), "{}", r.out);
+    let r = with("[ci]\nsetup = \"stacks/rust/setup\"\n");
+    assert!(
+        !r.ok() && r.out.contains("under .github/actions/"),
+        "{}",
+        r.out
+    );
+    let r = with("[ci]\nsetup = \".github/actions/none\"\n");
+    assert!(!r.ok() && r.out.contains("has no action.yml"), "{}", r.out);
+    let r = with("[ci]\ndeps_paths = [\"[\"]\n");
+    assert!(!r.ok() && r.out.contains("[ci].deps_paths"), "{}", r.out);
+    let r =
+        with("[[sweep]]\ntitle = \"A\"\nrun = \"true\"\n\n[[sweep]]\ntitle = \"A\"\nrun = \"x\"\n");
+    assert!(!r.ok() && r.out.contains("appears twice"), "{}", r.out);
+    let r = with("[[sweep]]\ntitle = \"A\"\nrun = \" \"\n");
+    assert!(
+        !r.ok() && r.out.contains("needs a `title` and a `run`"),
+        "{}",
+        r.out
+    );
+    let r = with("[ci]\nnope = 1\n");
+    assert!(!r.ok() && r.out.contains("unknown field"), "{}", r.out);
+}
+
+#[test]
+fn pr_title_exit_codes() {
+    let f = Fixture::dir("title");
+    assert!(f.repo(&["pr-title", "feat(docs): add the ledger"]).ok());
+    assert_eq!(f.repo(&["pr-title", "Add the ledger"]).code, 1);
+    assert_eq!(f.repo(&["nope"]).code, 2);
+}
